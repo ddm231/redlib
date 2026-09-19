@@ -103,21 +103,8 @@
 	<!-- post_type: {{ post.post_type }} -->
 	{% if post.post_type == "image" %}
 	<div class="post_media_content">
-		<a href="{{ post.media.url }}" class="post_media_image" >
-			{% if post.media.height == 0 || post.media.width == 0 %}
-			<!-- i.redd.it images special case -->
-			<img width="100%" height="100%" loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-			{% else %}
-			<svg
-				width="{{ post.media.width }}px"
-				height="{{ post.media.height }}px"
-				xmlns="http://www.w3.org/2000/svg">
-					<image width="100%" height="100%" href="{{ post.media.url }}"/>
-					<desc>
-						<img loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-					</desc>
-			</svg>
-			{% endif %}
+		<a href="{{ post.media.url }}" class="post_media_image" draggable="false">
+			<img width="100%" height="100%" loading="lazy" draggable="false" alt="Post image" src="{{ post.media.url }}"/>
 		</a>
 	</div>
 	{% else if post.post_type == "video" || post.post_type == "gif" %}
@@ -140,7 +127,7 @@
 	<div class="gallery">
 	{% for image in post.gallery -%}
 		<figure>
-			<a href="{{ image.url }}" ><img loading="lazy" alt="Gallery image" src="{{ image.url }}"/></a>
+			<a href="{{ image.url }}" draggable="false"><img loading="lazy" draggable="false" alt="Gallery image" src="{{ image.url }}"/></a>
 			<figcaption>
 				<p>{{ image.caption }}</p>
 				{% if image.outbound_url.len() > 0 %}
@@ -186,11 +173,20 @@
 			{% endif %}
 			{% call external_reddit_link(post.permalink) %}
 
-			{% if post.media.download_name != "" %}
+			{% if post.media.download_name != "" && post.post_type != "gallery" %}
 			<li>
 				<a href="{{ post.media.url }}" download="{{ post.media.download_name }}">
 					<span class="mobile_item">dl</span>
 					<span class="desktop_item">download</span>
+				</a>
+			</li>
+			{% endif %}
+			{% if post.post_type == "gallery" %}
+			<!-- Gallery download -->
+			<li class="download_gallery">
+				<a href="#" data-post-id="{{ post.id }}" data-base-name="redlib_{% if post.media.download_name != "" %}{{ post.media.download_name }}{% endif %}">
+					<span class="mobile_item">dl</span>
+					<span class="desktop_item">download all ({{ post.gallery.len() }})</span>
 				</a>
 			</li>
 			{% endif %}
@@ -252,21 +248,8 @@
 	<!-- POST MEDIA/THUMBNAIL -->
 	{% if (prefs.layout.is_empty() || prefs.layout == "card") && post.post_type == "image" %}
 	<div class="post_media_content">
-		<a href="{{ post.media.url }}" class="post_media_image {% if post.media.height < post.media.width*2 %}short{% endif %}" >
-			{% if post.media.height == 0 || post.media.width == 0 %}
-			<!-- i.redd.it images speical case -->
-			<img width="100%" height="100%" loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-			{% else %}
-			<svg
-				width="{{ post.media.width }}px"
-				height="{{ post.media.height }}px"
-				xmlns="http://www.w3.org/2000/svg">
-					<image width="100%" height="100%" href="{{ post.media.url }}"/>
-					<desc>
-						<img loading="lazy" alt="Post image" src="{{ post.media.url }}"/>
-					</desc>
-			</svg>
-			{% endif %}
+		<a href="{{ post.media.url }}" class="post_media_image {% if post.media.height < post.media.width*2 %}short{% endif %}" draggable="false">
+			<img width="100%" height="100%" loading="lazy" draggable="false" alt="Post image" src="{{ post.media.url }}"/>
 		</a>
 	</div>
 	{% else if (prefs.layout.is_empty() || prefs.layout == "card") && (post.post_type == "gif" || post.post_type == "video") %}
@@ -284,7 +267,7 @@
 	{% call render_hls_notification(format!("{}%23{}", &self.url[1..].replace("&", "%26").replace("+", "%2B"), post.id)) %}
 	{% endif %}
 	{% else if post.post_type != "self" %}
-	<a class="post_thumbnail{% if post.thumbnail.url.is_empty() %} no_thumbnail{% endif %}" href="{% if post.post_type == "link" %}{{ post.media.url }}{% else %}{{ post.permalink }}{% endif %}" rel="nofollow">
+	<a class="post_thumbnail{% if post.thumbnail.url.is_empty() %} no_thumbnail{% endif %}" href="{% if post.post_type == "link" %}{{ post.media.url }}{% else %}{{ post.permalink }}{% endif %}" rel="nofollow" draggable="false">
 		{% if post.thumbnail.url.is_empty() %}
 		<svg viewBox="0 0 100 106" width="140" height="53" xmlns="http://www.w3.org/2000/svg">
 			<title>Thumbnail</title>
@@ -292,12 +275,7 @@
 		</svg>
 		{% else %}
 		<div style="max-width:{{ post.thumbnail.width }}px;max-height:{{ post.thumbnail.height }}px;">
-			<svg width="{{ post.thumbnail.width }}px" height="{{ post.thumbnail.height }}px" xmlns="http://www.w3.org/2000/svg">
-				<image width="100%" height="100%" href="{{ post.thumbnail.url }}"/>
-				<desc>
-					<img loading="lazy" alt="Thumbnail" src="{{ post.thumbnail.url }}"/>
-				</desc>
-			</svg>
+			<img width="100%" height="100%" loading="lazy" draggable="false" alt="Thumbnail" src="{{ post.thumbnail.url }}"/>
 		</div>
 		{% endif %}
 		<span>{% if post.post_type == "link" %}{{ post.domain }}{% else %}{{ post.post_type }}{% endif %}</span>

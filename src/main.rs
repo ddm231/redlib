@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use futures_lite::FutureExt;
 use hyper::{header::HeaderValue, Body, Request, Response};
 use log::{info, warn};
-use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
+use redlib::client::{canonical_path, proxy, rate_limit_check, start_tor_fallback, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
@@ -69,6 +69,17 @@ async fn opensearch() -> Result<Response<Body>, String> {
 			.header("content-type", "application/opensearchdescription+xml")
 			.header("Cache-Control", "public, max-age=1209600, s-maxage=86400")
 			.body(include_bytes!("../static/opensearch.xml").as_ref().into())
+			.unwrap_or_default(),
+	)
+}
+
+async fn health_live() -> Result<Response<Body>, String> {
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "text/plain; charset=utf-8")
+			.header("cache-control", "no-store")
+			.body("ok\n".into())
 			.unwrap_or_default(),
 	)
 }
@@ -203,6 +214,7 @@ async fn main() {
 	LazyLock::force(&instance_info::INSTANCE_INFO);
 	info!("Creating OAUTH client.");
 	LazyLock::force(&OAUTH_CLIENT);
+	start_tor_fallback();
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -219,6 +231,7 @@ async fn main() {
 	}
 
 	// Read static files
+	app.at("/health/live").get(|_| health_live().boxed());
 	app.at("/style.css").get(|_| style().boxed());
 	app
 		.at("/manifest.json")
@@ -257,12 +270,16 @@ async fn main() {
 		.at("/check_update.js")
 		.get(|_| resource(include_str!("../static/check_update.js"), "text/javascript", false).boxed());
 	app.at("/copy.js").get(|_| resource(include_str!("../static/copy.js"), "text/javascript", false).boxed());
+	app
+		.at("/downloadGallery.js")
+		.get(|_| resource(include_str!("../static/downloadGallery.js"), "text/javascript", false).boxed());
 
 	app.at("/commits.atom").get(|_| async move { proxy_commit_info().await }.boxed());
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());
 
 	// Proxy media through Redlib
-	app.at("/vid/:id/:size").get(|r| proxy(r, "https://v.redd.it/{id}/DASH_{size}").boxed());
+	app.at("/vid/:id/dash/:size").get(|r| proxy(r, "https://v.redd.it/{id}/DASH_{size}").boxed());
+	app.at("/vid/:id/cmaf/:size").get(|r| proxy(r, "https://v.redd.it/{id}/CMAF_{size}").boxed());
 	app.at("/hls/:id/*path").get(|r| proxy(r, "https://v.redd.it/{id}/{path}").boxed());
 	app.at("/img/*path").get(|r| proxy(r, "https://i.redd.it/{path}").boxed());
 	app.at("/thumb/:point/:id").get(|r| proxy(r, "https://{point}.thumbs.redditmedia.com/{id}").boxed());
@@ -276,6 +293,7 @@ async fn main() {
 	app.at("/preview/:loc/:id").get(|r| proxy(r, "https://{loc}view.redd.it/{id}").boxed());
 	app.at("/style/*path").get(|r| proxy(r, "https://styles.redditmedia.com/{path}").boxed());
 	app.at("/static/*path").get(|r| proxy(r, "https://www.redditstatic.com/{path}").boxed());
+	app.at("/giphy/:id/:ext").get(|r| proxy(r, "https://media.giphy.com/media/{id}/giphy.{ext}").boxed());
 
 	// Browse user profile
 	app
@@ -372,10 +390,26 @@ async fn main() {
 		Box::pin(async move {
 			let sub = req.param("sub").unwrap_or_default();
 			match req.param("id").as_deref() {
-				// Share link
+				// Subreddit post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/r/{sub}/s/{id}"), 3).await {
 					Ok(Some(path)) => Ok(redirect(&path)),
 					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
+					Err(e) => error(req, &e).await,
+				},
+
+				// Error message for unknown pages
+				_ => error(req, "Nothing here").await,
+			}
+		})
+	});
+	app.at("/u/:name/s/:id").get(|req: Request<Body>| {
+		Box::pin(async move {
+			let name = req.param("name").unwrap_or_default();
+			match req.param("id").as_deref() {
+				// User post share link
+				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/u/{name}/s/{id}"), 3).await {
+					Ok(Some(path)) => Ok(redirect(&path)),
+					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a user that has been banned.").await,
 					Err(e) => error(req, &e).await,
 				},
 
@@ -392,13 +426,7 @@ async fn main() {
 				Some("best" | "hot" | "new" | "top" | "rising" | "controversial") => subreddit::community(req).await,
 
 				// Short link for post
-				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {
-					Ok(path_opt) => match path_opt {
-						Some(path) => Ok(redirect(&path)),
-						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
-					},
-					Err(e) => error(req, &e).await,
-				},
+				Some(id) if (5..8).contains(&id.len()) => Ok(redirect(&format!("/comments/{id}"))),
 
 				// Error message for unknown pages
 				_ => error(req, "Nothing here").await,

@@ -172,7 +172,7 @@ pub struct Flags {
 	pub stickied: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct Media {
 	pub url: String,
 	pub alt_url: String,
@@ -183,6 +183,53 @@ pub struct Media {
 }
 
 impl Media {
+	fn parse_thumbnail(data: &Value, post_type: &str) -> Self {
+		let thumbnail = data["thumbnail"].as_str().unwrap_or_default();
+		let thumbnail_url = format_url(thumbnail);
+
+		if !thumbnail_url.is_empty() {
+			return Self {
+				url: thumbnail_url,
+				alt_url: String::new(),
+				width: data["thumbnail_width"].as_i64().unwrap_or_default(),
+				height: data["thumbnail_height"].as_i64().unwrap_or_default(),
+				poster: String::new(),
+				download_name: String::new(),
+			};
+		}
+
+		// Reddit uses these sentinel values to prevent previews from exposing
+		// content before the user has opted in. Never replace them with a fallback.
+		if post_type != "link" || data["over_18"].as_bool().unwrap_or_default() || data["spoiler"].as_bool().unwrap_or_default() || matches!(thumbnail, "nsfw" | "spoiler") {
+			return Self::default();
+		}
+
+		let preview = &data["preview"]["images"][0];
+		let resolution = preview["resolutions"].as_array().and_then(|resolutions| {
+			resolutions
+				.iter()
+				.find(|resolution| resolution["width"].as_i64().unwrap_or_default() >= 320 && resolution["url"].as_str().is_some_and(|url| !url.is_empty()))
+				.or_else(|| resolutions.iter().rev().find(|resolution| resolution["url"].as_str().is_some_and(|url| !url.is_empty())))
+		});
+		let fallback = resolution.unwrap_or(&preview["source"]);
+		let url = format_url(fallback["url"].as_str().unwrap_or_default());
+
+		// Preview fallbacks must remain behind Redlib's media proxy. If Reddit ever
+		// supplies an unexpected third-party URL, retain the ordinary link icon.
+		if !url.starts_with("/preview/") && !url.starts_with("/img/") && !url.starts_with("/thumb/") {
+			return Self::default();
+		}
+
+		Self {
+			url,
+			alt_url: String::new(),
+			width: fallback["width"].as_i64().unwrap_or_default(),
+			height: fallback["height"].as_i64().unwrap_or_default(),
+			poster: String::new(),
+			download_name: String::new(),
+		}
+	}
+
 	pub async fn parse(data: &Value) -> (String, Self, Vec<GalleryMedia>) {
 		let mut gallery = Vec::new();
 
@@ -381,6 +428,7 @@ impl Post {
 
 			// Determine the type of media along with the media URL
 			let (post_type, media, gallery) = Media::parse(data).await;
+			let thumbnail = Media::parse_thumbnail(data, &post_type);
 			let awards = Awards::parse(&data["all_awardings"]);
 
 			// selftext_html is set for text posts when browsing.
@@ -415,14 +463,7 @@ impl Post {
 				},
 				upvote_ratio: ratio as i64,
 				post_type,
-				thumbnail: Media {
-					url: format_url(val(post, "thumbnail").as_str()),
-					alt_url: String::new(),
-					width: data["thumbnail_width"].as_i64().unwrap_or_default(),
-					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
-					poster: String::new(),
-					download_name: String::new(),
-				},
+				thumbnail,
 				media,
 				domain: val(post, "domain"),
 				flair: Flair {
@@ -728,6 +769,14 @@ impl Preferences {
 		}
 	}
 
+	pub fn is_subscribed(&self, name: &str) -> bool {
+		self.subscriptions.iter().any(|subscription| subscription.eq_ignore_ascii_case(name))
+	}
+
+	pub fn is_filtered(&self, name: &str) -> bool {
+		self.filters.iter().any(|filter| filter.eq_ignore_ascii_case(name))
+	}
+
 	pub fn to_urlencoded(&self) -> Result<String, String> {
 		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
 	}
@@ -758,7 +807,11 @@ pub fn deflate_decompress(i: Vec<u8>) -> Result<Vec<u8>, String> {
 
 /// Gets a `HashSet` of filters from the cookie in the given `Request`.
 pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
-	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+	setting(req, "filters")
+		.split('+')
+		.map(str::to_ascii_lowercase)
+		.filter(|s| !s.is_empty())
+		.collect::<HashSet<String>>()
 }
 
 /// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being
@@ -774,7 +827,11 @@ pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, b
 	if posts.is_empty() {
 		(0, false)
 	} else {
-		posts.retain(|p| !(filters.contains(&p.community) || filters.contains(&["u_", &p.author.name].concat())));
+		posts.retain(|p| {
+			let community = p.community.to_ascii_lowercase();
+			let author = format!("u_{}", p.author.name.to_ascii_lowercase());
+			!(filters.contains(&community) || filters.contains(&author))
+		});
 
 		// Get the length of the Vec<Post> after applying the filter.
 		// If lb > la, then at least one post was removed.
@@ -794,6 +851,7 @@ pub async fn parse_post(post: &Value) -> Post {
 
 	// Determine the type of media along with the media URL
 	let (post_type, media, gallery) = Media::parse(&post["data"]).await;
+	let thumbnail = Media::parse_thumbnail(&post["data"], &post_type);
 
 	let created_ts = post["data"]["created_utc"].as_f64().unwrap_or_default().round() as u64;
 
@@ -847,14 +905,7 @@ pub async fn parse_post(post: &Value) -> Post {
 		upvote_ratio: ratio as i64,
 		post_type,
 		media,
-		thumbnail: Media {
-			url: format_url(val(post, "thumbnail").as_str()),
-			alt_url: String::new(),
-			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
-			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
-			poster: String::new(),
-			download_name: String::new(),
-		},
+		thumbnail,
 		flair: Flair {
 			flair_parts: FlairPart::parse(
 				post["data"]["link_flair_type"].as_str().unwrap_or_default(),
@@ -1004,7 +1055,7 @@ static REGEX_URL_WWW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://w
 static REGEX_URL_OLD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://old\.reddit\.com/(.*)").unwrap());
 static REGEX_URL_NP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://np\.reddit\.com/(.*)").unwrap());
 static REGEX_URL_PLAIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://reddit\.com/(.*)").unwrap());
-static REGEX_URL_VIDEOS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$|\?source=fallback))").unwrap());
+static REGEX_URL_VIDEOS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.*)/(DASH|CMAF)_([0-9]{2,4}(\.mp4|$|\?source=fallback))").unwrap());
 static REGEX_URL_VIDEOS_HLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.+)/(HLSPlaylist\.m3u8.*)$").unwrap());
 static REGEX_URL_IMAGES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://i\.redd\.it/(.*)").unwrap());
 static REGEX_URL_THUMBS_A: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://a\.thumbs\.redditmedia\.com/(.*)").unwrap());
@@ -1027,6 +1078,7 @@ pub fn format_url(url: &str) -> String {
 				regex.captures(url).map_or(String::new(), |caps| match segments {
 					1 => [format, &caps[1]].join(""),
 					2 => [format, &caps[1], "/", &caps[2]].join(""),
+					3 => [format, &caps[1], "/", caps[2].to_lowercase().as_str(), "/", &caps[3]].join(""),
 					_ => String::new(),
 				})
 			};
@@ -1057,7 +1109,7 @@ pub fn format_url(url: &str) -> String {
 				"old.reddit.com" => capture(&REGEX_URL_OLD, "/", 1),
 				"np.reddit.com" => capture(&REGEX_URL_NP, "/", 1),
 				"reddit.com" => capture(&REGEX_URL_PLAIN, "/", 1),
-				"v.redd.it" => chain!(capture(&REGEX_URL_VIDEOS, "/vid/", 2), capture(&REGEX_URL_VIDEOS_HLS, "/hls/", 2)),
+				"v.redd.it" => chain!(capture(&REGEX_URL_VIDEOS, "/vid/", 3), capture(&REGEX_URL_VIDEOS_HLS, "/hls/", 2)),
 				"i.redd.it" => capture(&REGEX_URL_IMAGES, "/img/", 1),
 				"a.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_A, "/thumb/a/", 1),
 				"b.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_B, "/thumb/b/", 1),
@@ -1134,11 +1186,11 @@ pub fn rewrite_urls(input_text: &str) -> String {
 			let _image_replacement = if REDDIT_PREVIEW_REGEX.find(image_caption).is_none() {
 				// Without this " would show as \" instead. "\&quot;" is how the quotes are formatted within image_text beforehand
 				format!(
-					"<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a><figcaption>{}</figcaption></figure>",
+					"<figure><a draggable=\"false\" href=\"{image_url}<img loading=\"lazy\" draggable=\"false\" src=\"{image_url}</a><figcaption>{}</figcaption></figure>",
 					image_caption.replace("\\&quot;", "\"")
 				)
 			} else {
-				format!("<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a></figure>")
+				format!("<figure><a draggable=\"false\" href=\"{image_url}<img loading=\"lazy\" draggable=\"false\" src=\"{image_url}</a></figure>")
 			};
 
 			/* In order to know if we're dealing with a normal or external preview we need to take a look at the first capture group of REDDIT_PREVIEW_REGEX
@@ -1156,6 +1208,24 @@ pub fn rewrite_urls(input_text: &str) -> String {
 				.replace(&image_to_replace, &_image_replacement)
 		}
 	}
+}
+
+// Match Giphy URLs in comment anchor tags, capturing the GIF ID
+// Handles: giphy.com/gifs/ID, media.giphy.com/media/ID, i.giphy.com/ID
+static GIPHY_EMBED_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r#"(?i)<a\s+href="https?://(?:www\.)?(?:giphy\.com/(?:gifs|clips)|media\.giphy\.com/media|i\.giphy\.com)/([a-z0-9]+)[^"]*"[^>]*>[^<]*</a>"#).unwrap()
+});
+
+/// Rewrite Giphy URLs in comment body to embedded video elements
+fn rewrite_giphy_links(comment: &str) -> String {
+	GIPHY_EMBED_REGEX
+		.replace_all(comment, |caps: &regex::Captures| {
+			let id = &caps[1];
+			format!(
+				r#"<div class="giphy-embed-container"><a href="/giphy/{id}/gif"><video class="giphy-embed" loop poster="/giphy/{id}/gif"><source src="/giphy/{id}/mp4" type="video/mp4"></video></a></div>"#
+			)
+		})
+		.to_string()
 }
 
 // These links all follow a pattern of "https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/SUBREDDIT_ID/RANDOM_FILENAME.png"
@@ -1236,7 +1306,10 @@ pub fn rewrite_emotes(media_metadata: &Value, comment: String) -> String {
 	comment = render_bullet_lists(&comment);
 
 	// Call rewrite_urls() to transform any other Reddit links
-	rewrite_urls(&comment)
+	let comment = rewrite_urls(&comment);
+
+	// Rewrite Giphy links to embedded videos
+	rewrite_giphy_links(&comment)
 }
 
 /// Format vote count to a string that will be displayed.
@@ -1328,7 +1401,37 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 	.render()
 	.unwrap_or_default();
 
-	Ok(Response::builder().status(404).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+	let temporary = temporary_error_retry_after(msg);
+	let mut response = Response::builder().status(if temporary.is_some() { 503 } else { 404 }).header("content-type", "text/html");
+	if let Some(Some(seconds)) = temporary {
+		response = response.header("Retry-After", seconds.to_string());
+	}
+	Ok(response.body(body.into()).unwrap_or_default())
+}
+
+fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
+	const TEMPORARY_ERRORS: [&str; 12] = [
+		"Reddit requests are temporarily paused",
+		"Reddit is temporarily rejecting this instance",
+		"Reddit rate limit exceeded",
+		"Refreshing the anonymous Reddit session",
+		"OAuth token refresh is temporarily unavailable",
+		"Reddit is having issues",
+		"Reddit returned an empty response",
+		"Reddit API request timed out",
+		"Reddit request limiter is unavailable",
+		"Couldn't send request to Reddit",
+		"Failed receiving body from Reddit",
+		"Failed to parse page JSON data",
+	];
+	if !TEMPORARY_ERRORS.iter().any(|prefix| msg.starts_with(prefix)) {
+		return None;
+	}
+	let retry_after = msg
+		.split_once("Retry in ")
+		.and_then(|(_, suffix)| suffix.split_whitespace().next())
+		.and_then(|seconds| seconds.parse::<u64>().ok());
+	Some(retry_after)
 }
 
 /// Renders a generic info landing page.
@@ -1451,7 +1554,21 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-	use super::{deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};
+	use super::{
+		deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after, url_path_basename, Media,
+		Post, Preferences,
+	};
+
+	#[test]
+	fn temporary_errors_use_service_unavailable_retry_metadata() {
+		assert_eq!(
+			temporary_error_retry_after("Reddit is temporarily rejecting this instance. Retry in 42 seconds"),
+			Some(Some(42))
+		);
+		assert_eq!(temporary_error_retry_after("Refreshing the anonymous Reddit session. Retry in 2 seconds"), Some(Some(2)));
+		assert_eq!(temporary_error_retry_after("Reddit is having issues, check if there's an outage"), Some(None));
+		assert_eq!(temporary_error_retry_after("r/example is a private community"), None);
+	}
 
 	#[test]
 	fn format_num_works() {
@@ -1501,7 +1618,8 @@ mod tests {
 			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
 			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
 		);
-		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/360.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/dash/360.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/CMAF_720.mp4?source=fallback"), "/vid/foo/cmaf/720.mp4");
 		assert_eq!(
 			format_url("https://v.redd.it/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"),
 			"/hls/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"
@@ -1517,6 +1635,124 @@ mod tests {
 		assert_eq!(format_url("default"), "");
 		assert_eq!(format_url("nsfw"), "");
 		assert_eq!(format_url("spoiler"), "");
+	}
+
+	#[test]
+	fn thumbnail_keeps_reddit_thumbnail() {
+		let data = serde_json::json!({
+			"thumbnail": "https://a.thumbs.redditmedia.com/article.jpg",
+			"thumbnail_width": 140,
+			"thumbnail_height": 79,
+			"preview": {
+				"images": [{
+					"source": {
+						"url": "https://external-preview.redd.it/source.jpg",
+						"width": 640,
+						"height": 360
+					}
+				}]
+			}
+		});
+
+		let thumbnail = Media::parse_thumbnail(&data, "link");
+
+		assert_eq!(thumbnail.url, "/thumb/a/article.jpg");
+		assert_eq!((thumbnail.width, thumbnail.height), (140, 79));
+	}
+
+	#[test]
+	fn thumbnail_uses_suitable_article_preview_resolution() {
+		let data = serde_json::json!({
+			"thumbnail": "default",
+			"preview": {
+				"images": [{
+					"resolutions": [
+						{
+							"url": "https://external-preview.redd.it/article.jpg?width=108",
+							"width": 108,
+							"height": 61
+						},
+						{
+							"url": "https://external-preview.redd.it/article.jpg?width=320",
+							"width": 320,
+							"height": 180
+						}
+					],
+					"source": {
+						"url": "https://external-preview.redd.it/article.jpg?width=640",
+						"width": 640,
+						"height": 360
+					}
+				}]
+			}
+		});
+
+		let thumbnail = Media::parse_thumbnail(&data, "link");
+
+		assert_eq!(thumbnail.url, "/preview/external-pre/article.jpg?width=320");
+		assert_eq!((thumbnail.width, thumbnail.height), (320, 180));
+	}
+
+	#[test]
+	fn thumbnail_uses_preview_source_when_resolutions_are_missing() {
+		let data = serde_json::json!({
+			"thumbnail": "default",
+			"preview": {
+				"images": [{
+					"source": {
+						"url": "https://external-preview.redd.it/article.jpg?width=640",
+						"width": 640,
+						"height": 360
+					}
+				}]
+			}
+		});
+
+		let thumbnail = Media::parse_thumbnail(&data, "link");
+
+		assert_eq!(thumbnail.url, "/preview/external-pre/article.jpg?width=640");
+		assert_eq!((thumbnail.width, thumbnail.height), (640, 360));
+	}
+
+	#[test]
+	fn thumbnail_does_not_reveal_restricted_previews() {
+		for (thumbnail, over_18, spoiler) in [("nsfw", false, false), ("spoiler", false, false), ("default", true, false), ("default", false, true)] {
+			let data = serde_json::json!({
+				"thumbnail": thumbnail,
+				"over_18": over_18,
+				"spoiler": spoiler,
+				"preview": {
+					"images": [{
+						"source": {
+							"url": "https://external-preview.redd.it/restricted.jpg",
+							"width": 640,
+							"height": 360
+						}
+					}]
+				}
+			});
+
+			assert!(Media::parse_thumbnail(&data, "link").url.is_empty());
+		}
+	}
+
+	#[test]
+	fn thumbnail_rejects_unproxied_and_non_link_fallbacks() {
+		let data = serde_json::json!({
+			"thumbnail": "default",
+			"preview": {
+				"images": [{
+					"source": {
+						"url": "https://example.com/article.jpg",
+						"width": 640,
+						"height": 360
+					}
+				}]
+			}
+		});
+
+		assert!(Media::parse_thumbnail(&data, "link").url.is_empty());
+		assert!(Media::parse_thumbnail(&data, "self").url.is_empty());
 	}
 	#[test]
 	fn serialize_prefs() {
@@ -1586,7 +1822,7 @@ mod tests {
 	fn test_rewriting_image_links() {
 		let input =
 			r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
-		let output = r#"<figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure>"#;
+		let output = r#"<figure><a draggable="false" href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" draggable="false" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure>"#;
 		assert_eq!(rewrite_urls(input), output);
 	}
 
@@ -1645,6 +1881,15 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		let serialized = serde_json::to_string(&prefs).unwrap();
 		let deserialized: Preferences = serde_json::from_str(&serialized).unwrap();
 		assert_eq!(prefs, deserialized);
+	}
+
+	#[test]
+	fn test_preference_membership_is_case_insensitive() {
+		let mut prefs = Preferences::default();
+		prefs.subscriptions.push("Rust".to_string());
+		prefs.filters.push("u_Example".to_string());
+		assert!(prefs.is_subscribed("rust"));
+		assert!(prefs.is_filtered("u_example"));
 	}
 
 	#[test]

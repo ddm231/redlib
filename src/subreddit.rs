@@ -1,7 +1,8 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::utils::{
-	Post, Preferences, Subreddit, catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, to_absolute_url, val
+	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, to_absolute_url, val, Post,
+	Preferences, Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use crate::{config, utils};
@@ -12,7 +13,7 @@ use hyper::{Body, Request, Response};
 
 use chrono::DateTime;
 use regex::Regex;
-use rss::{ChannelBuilder, Item, Enclosure};
+use rss::{ChannelBuilder, Enclosure, Item};
 use std::sync::LazyLock;
 use time::{Duration, OffsetDateTime};
 
@@ -67,7 +68,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subscribed = setting(&req, "subscriptions");
 	let front_page = setting(&req, "front_page");
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
-	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
+	let post_sort = setting(&req, "post_sort");
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 
 	let sub_name = req.param("sub").unwrap_or(if front_page == "default" || front_page.is_empty() {
@@ -146,7 +147,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let filters = get_filters(&req);
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-	if sub_name.split('+').all(|s| filters.contains(s)) {
+	if sub_name.split('+').all(|s| filters.contains(&s.to_ascii_lowercase())) {
 		Ok(template(&SubredditTemplate {
 			sub,
 			posts: Vec::new(),
@@ -167,8 +168,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				if sort == "new" {
-					posts.sort_by(|a, b| b.created_ts.cmp(&a.created_ts));
-					posts.sort_by(|a, b| b.flags.stickied.cmp(&a.flags.stickied));
+					posts.sort_by_key(|post| std::cmp::Reverse(post.created_ts));
+					posts.sort_by_key(|post| std::cmp::Reverse(post.flags.stickied));
 				}
 				Ok(template(&SubredditTemplate {
 					sub,
@@ -283,66 +284,29 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	let mut sub_list = preferences.subscriptions;
 	let mut filters = preferences.filters;
 
-	// Retrieve list of posts for these subreddits to extract display names
-
-	let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
-	let display_lookup: Vec<(String, &str)> = match &posts {
-		Ok(posts) => posts["data"]["children"]
-			.as_array()
-			.map(|list| {
-				list
-					.iter()
-					.map(|post| {
-						let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
-						(display_name.to_lowercase(), display_name)
-					})
-					.collect::<Vec<_>>()
-			})
-			.unwrap_or_default(),
-		Err(_) => vec![],
-	};
-
 	// Find each subreddit name (separated by '+') in sub parameter
 	for part in sub.split('+').filter(|x| x != &"") {
-		// Retrieve display name for the subreddit
-		let display;
-		let part = if part.starts_with("u_") {
-			part
-		} else if let Some(&(_, display)) = display_lookup.iter().find(|x| x.0 == part.to_lowercase()) {
-			// This is already known, doesn't require separate request
-			display
-		} else {
-			// This subreddit display name isn't known, retrieve it
-			let path: String = format!("/r/{part}/about.json?raw_json=1");
-			display = json(path, true).await;
-			match &display {
-				Ok(display) => display["data"]["display_name"].as_str(),
-				Err(_) => None,
-			}
-			.unwrap_or(part)
-		};
-
 		// Modify sub list based on action
-		if action.contains(&"subscribe".to_string()) && !sub_list.contains(&part.to_owned()) {
+		if action.contains(&"subscribe".to_string()) && !contains_ignore_ascii_case(&sub_list, part) {
 			// Add each sub name to the subscribed list
 			sub_list.push(part.to_owned());
-			filters.retain(|s| s.to_lowercase() != part.to_lowercase());
+			filters.retain(|s| !s.eq_ignore_ascii_case(part));
 			// Reorder sub names alphabetically
 			sub_list.sort_by_key(|a| a.to_lowercase());
 			filters.sort_by_key(|a| a.to_lowercase());
 		} else if action.contains(&"unsubscribe".to_string()) {
 			// Remove sub name from subscribed list
-			sub_list.retain(|s| s.to_lowercase() != part.to_lowercase());
-		} else if action.contains(&"filter".to_string()) && !filters.contains(&part.to_owned()) {
+			sub_list.retain(|s| !s.eq_ignore_ascii_case(part));
+		} else if action.contains(&"filter".to_string()) && !contains_ignore_ascii_case(&filters, part) {
 			// Add each sub name to the filtered list
 			filters.push(part.to_owned());
-			sub_list.retain(|s| s.to_lowercase() != part.to_lowercase());
+			sub_list.retain(|s| !s.eq_ignore_ascii_case(part));
 			// Reorder sub names alphabetically
 			filters.sort_by_key(|a| a.to_lowercase());
 			sub_list.sort_by_key(|a| a.to_lowercase());
 		} else if action.contains(&"unfilter".to_string()) {
 			// Remove sub name from filtered list
-			filters.retain(|s| s.to_lowercase() != part.to_lowercase());
+			filters.retain(|s| !s.eq_ignore_ascii_case(part));
 		}
 	}
 
@@ -454,6 +418,10 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	}
 
 	Ok(response)
+}
+
+fn contains_ignore_ascii_case(values: &[String], candidate: &str) -> bool {
+	values.iter().any(|value| value.eq_ignore_ascii_case(candidate))
 }
 
 pub async fn wiki(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -650,34 +618,24 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 
 // Set enclosure image for RSS feed item
 fn apply_enclosure(item: &mut Item, post: &Post) {
-	item.set_enclosure(get_rss_image(&post));
+	item.set_enclosure(get_rss_image(post));
 
 	// Embed the number of gallery images in description and content since
 	// only the first image in the gallery is used for the enclosure
 	if post.post_type == "gallery" && post.gallery.len() > 1 {
-		item.set_description(
-			format!("<a href='{}'>Gallery with {} images</a>",
-				to_absolute_url(&post.permalink),
-				post.gallery.len()
-			)
-		);
+		item.set_description(format!("<a href='{}'>Gallery with {} images</a>", to_absolute_url(&post.permalink), post.gallery.len()));
 
 		if let Some(content) = item.content() {
-			let new_content = format!(
-				"{}<br/>{}",
-				item.description().unwrap_or(""),
-				content,
-			);
+			let new_content = format!("{}<br/>{}", item.description().unwrap_or(""), content,);
 			item.set_content(new_content);
 		}
 	}
-
 }
 
 fn get_rss_image(post: &Post) -> Option<Enclosure> {
 	let image_url = match post.post_type.as_str() {
 		"image" => Some(post.media.url.clone()),
-		"gallery" => post.gallery.get(0).and_then(|media| decode_html(&media.url).ok()),
+		"gallery" => post.gallery.first().and_then(|media| decode_html(&media.url).ok()),
 		"gif" | "video" => decode_html(&post.media.poster).ok(),
 		_ => None,
 	};
@@ -694,30 +652,34 @@ fn get_rss_image(post: &Post) -> Option<Enclosure> {
 /// Determines the MIME type based on file extension in a URL.
 /// Handles both absolute and relative URLs with query parameters.
 fn get_mime_type(url: &str) -> &'static str {
-    // Extract the path component, removing query parameters
-    let path = url.split('?').next().unwrap_or(url);
-    
-    // Get the file extension (everything after the last dot)
-    let extension = path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    
-    // Match common image extensions
-    match extension.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        _ => "application/octet-stream",
-    }
+	// Extract the path component, removing query parameters
+	let path = url.split('?').next().unwrap_or(url);
+
+	// Get the file extension (everything after the last dot)
+	let extension = path.rsplit('.').next().unwrap_or("").to_lowercase();
+
+	// Match common image extensions
+	match extension.as_str() {
+		"jpg" | "jpeg" => "image/jpeg",
+		"png" => "image/png",
+		"gif" => "image/gif",
+		"webp" => "image/webp",
+		"svg" => "image/svg+xml",
+		_ => "application/octet-stream",
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_subscription_names_are_compared_case_insensitively() {
+		let values = vec!["Rust".to_string(), "u_Example".to_string()];
+		assert!(contains_ignore_ascii_case(&values, "rust"));
+		assert!(contains_ignore_ascii_case(&values, "U_example"));
+		assert!(!contains_ignore_ascii_case(&values, "privacy"));
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_fetching_subreddit() {

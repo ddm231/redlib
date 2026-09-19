@@ -1,109 +1,144 @@
-name: Container build
+name: Docker Hub
 
 on:
-  workflow_run:
-    workflows: ["Release Build"]
-    types:
-      - completed
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: docker-hub-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
-  REGISTRY_IMAGE: quay.io/redlib/redlib
+  REGISTRY_IMAGE: luciferscircle/redlib
 
 jobs:
-  build:
+  verify:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { platform: linux/amd64, target: x86_64-unknown-linux-musl }
-          - { platform: linux/arm64, target: aarch64-unknown-linux-musl }
-          - { platform: linux/arm/v7, target: armv7-unknown-linux-musleabihf }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          images: ${{ env.REGISTRY_IMAGE }}
-          tags: |
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+          components: rustfmt, clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check code
+        run: cargo check --locked --all-targets
+      - name: Run deterministic resilience tests
+        run: |
+          cargo test --locked --lib test_parse_max_concurrency
+          cargo test --locked --lib test_parse_delay_seconds
+          cargo test --locked --lib test_parse_rate_limit_count_rejects_invalid_values
+          cargo test --locked --lib test_rate_limit_delay_adds_margin_and_respects_cap
+          cargo test --locked --lib test_classify_throttle_response_separates_edge_denials
+          cargo test --locked --lib test_edge_throttle_delay_escalates_and_caps
+          cargo test --locked --lib test_media_diagnostics_group_destinations_and_results
+          cargo test --locked --lib test_quota_admission_never_uses_safety_reserve
+          cargo test --locked --lib test_quota_rotation_requires_known_exhausted_current_generation
+          cargo test --locked --lib test_emergency_quota_rotation_requires_reserve_exhaustion_and_long_wait
+          cargo test --locked --lib test_emergency_quota_rotation_claim_survives_stable_refresh_but_not_new_epoch
+          cargo test --locked --lib test_fresh_low_discovery_does_not_rearm_rotation
+          cargo test --locked --lib test_healthy_discovery_arms_quota_rotation
+          cargo test --locked --lib test_out_of_order_quota_responses_cannot_replenish_budget
+          cargo test --locked --lib test_early_new_window_response_cannot_poison_low_budget_deadline
+          cargo test --locked --lib test_reset_only_response_cannot_poison_known_deadline
+          cargo test --locked --lib test_small_same_window_reset_jitter_is_preserved
+          cargo test --locked --lib test_token_refresh_preserves_quota_window
+          cargo test --locked --lib test_fresh_identity_starts_unknown_quota_window_and_ignores_late_responses
+          cargo test --locked --lib test_stale_generation_cannot_reserve_or_replace_budget
+          cargo test --locked --lib test_headerless_backend_leaves_discovery_mode
+          cargo test --locked --lib test_stale_discovery_releases_probe_without_applying_headers
+          cargo test --locked --lib test_headerless_redirect_preserves_exclusive_discovery_with_a_new_reservation
+          cargo test --locked --lib test_response_after_reset_establishes_new_quota_window
+          cargo test --locked --lib test_reset_allows_exactly_one_discovery_probe
+          cargo test --locked --lib test_redirect_validation_rejects_off_origin_and_normalizes_reddit
+          cargo test --locked --lib test_upstream_guard_opens_after_burst_and_recovers
+          cargo test --locked --lib test_redirect_continuation_observes_new_cooldowns
+          cargo test --locked --lib test_edge_throttle_uses_one_probe_and_escalates_until_success
+          cargo test --locked --lib test_edge_fallback_is_lane_isolated_and_never_bypasses_quota
+          cargo test --locked --lib test_tor_retry_requires_this_request_to_be_edge_rejected
+          cargo test --locked --lib test_only_edge_redirect_deferrals_qualify_for_tor_retry
+          cargo test --locked --lib test_equal_numbered_quota_tickets_remain_lane_scoped
+          cargo test --locked --lib test_oauth_refresh_preserves_all_cooldowns
+          cargo test --locked --lib test_fresh_identity_clears_only_quota_cooldown
+          cargo test --locked --lib test_response_started_before_edge_denial_cannot_close_circuit
+          cargo test --locked --lib test_abandoned_half_open_probe_reopens_edge_circuit
+          cargo test --locked --lib test_expired_half_open_probe_cannot_block_or_recover_circuit
+          cargo test --locked --lib test_api_path_normalization_is_conservative_and_deterministic
+          cargo test --locked --lib test_json_cache_policy_is_narrow
+          cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
+          cargo test --locked --lib temporary_errors_use_service_unavailable_retry_metadata
+          cargo test --locked --lib test_identical_cache_misses_are_coalesced
+          cargo test --locked --lib test_comment_search_parameters_stay_local
+          cargo test --locked --lib test_non_comment_query_is_preserved
+          cargo test --locked --lib test_community_only_search_skips_post_listing
+          cargo test --locked --lib test_subscription_names_are_compared_case_insensitively
+          cargo test --locked --lib test_preference_membership_is_case_insensitive
+          cargo test --locked --lib test_refresh_retry_delay_is_exponential_and_capped
+          cargo test --locked --lib test_active_quota_rotation_matches_generation_and_epoch
+          cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
+          cargo test --locked --lib test_refresh_backoff_recovers_after_success
+          cargo test --locked --lib test_token_refresh_delay_cannot_underflow
+          cargo test --locked --lib test_refresh_reason_selects_stable_or_fresh_identity
+          cargo test --locked --lib test_alternate_backend_changes_kind
+          cargo test --locked --lib tor_fallback_requires_explicit_valid_socks5h_proxy
+          cargo test --locked --lib each_lane_has_matching_origins_and_redirect_allowlist
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Calculate upstream divergence
+        id: divergence
+        run: |
+          git remote add upstream-status https://github.com/redlib-org/redlib.git
+          git fetch --no-tags upstream-status main
+          echo "ahead=$(git rev-list --count upstream-status/main..HEAD)" >> "$GITHUB_OUTPUT"
+          echo "behind=$(git rev-list --count HEAD..upstream-status/main)" >> "$GITHUB_OUTPUT"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to Quay.io Container Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          file: Dockerfile
-          build-args: TARGET=${{ matrix.target }}
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.target }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-  merge:
-    runs-on: ubuntu-latest
-    needs:
-      - build
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4.1.7
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Docker meta
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Generate image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-      - name: Login to Quay.io Container Registry
-        uses: docker/login-action@v3
+            type=raw,value=latest
+            type=sha,prefix=sha-
+      - name: Build and push fork source
+        uses: docker/build-push-action@v6
         with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
-      - name: Create manifest list and push
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
-
-      # - name: Push README to Quay.io
-      #   uses: christian-korneck/update-container-description-action@v1
-      #   env:
-      #     DOCKER_APIKEY: ${{ secrets.APIKEY__QUAY_IO }}
-      #   with:
-      #     destination_container_repo: quay.io/redlib/redlib
-      #     provider: quay
-      #     readme_file: 'README.md'
-
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+          context: .
+          file: Dockerfile.ubuntu
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            REDLIB_BUILD_GIT_SHA=${{ github.sha }}
+            REDLIB_BUILD_UPSTREAM_AHEAD=${{ steps.divergence.outputs.ahead }}
+            REDLIB_BUILD_UPSTREAM_BEHIND=${{ steps.divergence.outputs.behind }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -20,6 +20,12 @@ RUN cargo build --release --locked --bin redlib
 RUN rm ./src/main.rs && rmdir ./src
 
 # copy the source and build the redlib binary
+ARG REDLIB_BUILD_GIT_SHA=""
+ARG REDLIB_BUILD_UPSTREAM_AHEAD=""
+ARG REDLIB_BUILD_UPSTREAM_BEHIND=""
+ENV REDLIB_BUILD_GIT_SHA=${REDLIB_BUILD_GIT_SHA}
+ENV REDLIB_BUILD_UPSTREAM_AHEAD=${REDLIB_BUILD_UPSTREAM_AHEAD}
+ENV REDLIB_BUILD_UPSTREAM_BEHIND=${REDLIB_BUILD_UPSTREAM_BEHIND}
 COPY . ./
 RUN cargo build --release --locked --bin redlib
 RUN echo "finished building redlib!"
@@ -28,6 +34,11 @@ RUN echo "finished building redlib!"
 ## release image
 ########################
 FROM ubuntu:${UBUNTU_RELEASE_VERSION} AS release
+
+# Runtime CA roots are required by wreq, and wget is used by HEALTHCHECK.
+RUN apt-get update \
+    && apt-get -y install --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
 
 # Import redlib binary from builder
 COPY --from=builder /redlib/target/release/redlib /usr/local/bin/redlib
